@@ -1,5 +1,7 @@
 #![no_std]
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, token, Address, Env};
+use soroban_sdk::{
+    contract, contractevent, contractimpl, contracttype, token, Address, Env, Vec,
+};
 
 #[contract]
 pub struct RwaMarketplace;
@@ -14,6 +16,7 @@ pub enum DataKey {
     AvailableShares,
     Paused,
     Balance(Address),
+    Holders, // ← NEW: registry of all unique holder addresses
 }
 
 #[contractevent(data_format = "vec")]
@@ -43,6 +46,14 @@ pub struct EventEmergencyWithdraw {
     amount: i128,
 }
 
+// ← NEW: dividend distribution event
+#[contractevent(data_format = "vec")]
+pub struct EventDistributeDividends {
+    token: Address,
+    total_amount: i128,
+    holder_count: u32,
+}
+
 #[contractimpl]
 impl RwaMarketplace {
     pub fn init(env: Env, admin: Address, payment_token: Address, price: i128, total_shares: u32) {
@@ -58,6 +69,10 @@ impl RwaMarketplace {
         env.storage().instance().set(&DataKey::TotalShares, &total_shares);
         env.storage().instance().set(&DataKey::AvailableShares, &total_shares);
         env.storage().instance().set(&DataKey::Paused, &false);
+
+        // Initialize empty holders registry
+        let holders: Vec<Address> = Vec::new(&env);
+        env.storage().instance().set(&DataKey::Holders, &holders);
 
         EventInit { admin, payment_token, price, total_shares }.publish(&env);
     }
@@ -100,17 +115,114 @@ impl RwaMarketplace {
             .instance()
             .set(&DataKey::AvailableShares, &(available - shares));
 
-        let mut buyer_balance: u32 = env
+        let prev_balance: u32 = env
             .storage()
             .persistent()
             .get(&DataKey::Balance(buyer.clone()))
             .unwrap_or(0);
-        buyer_balance += shares;
+
+        let new_balance = prev_balance + shares;
         env.storage()
             .persistent()
-            .set(&DataKey::Balance(buyer.clone()), &buyer_balance);
+            .set(&DataKey::Balance(buyer.clone()), &new_balance);
+
+        // Register as new holder only on first purchase (prev_balance was 0)
+        if prev_balance == 0 {
+            let mut holders: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::Holders)
+                .unwrap_or_else(|| Vec::new(&env));
+            holders.push_back(buyer.clone());
+            env.storage().instance().set(&DataKey::Holders, &holders);
+        }
 
         EventBuyShares { buyer, shares, total_cost }.publish(&env);
+    }
+
+    /// Distribute `total_amount` of `token` pro-rata among all current holders
+    /// based on their share count relative to total issued shares.
+    ///
+    /// Only the admin may call this. The contract must hold enough `token`
+    /// balance to cover `total_amount` before calling.
+    pub fn distribute_dividends(env: Env, token: Address, total_amount: i128) {
+        // Only admin can distribute
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if total_amount <= 0 {
+            panic!("Dividend amount must be positive");
+        }
+
+        let total_shares: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TotalShares)
+            .unwrap();
+
+        if total_shares == 0 {
+            panic!("No shares have been issued");
+        }
+
+        let holders: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Holders)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        if holders.is_empty() {
+            panic!("No holders registered");
+        }
+
+        let client = token::TokenClient::new(&env, &token);
+        let contract_addr = env.current_contract_address();
+
+        // Track holders whose balance has dropped to 0 (to clean up registry)
+        let mut active_holders: Vec<Address> = Vec::new(&env);
+
+        for holder in holders.iter() {
+            let holder_shares: u32 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Balance(holder.clone()))
+                .unwrap_or(0);
+
+            if holder_shares == 0 {
+                // Balance is zero — skip and exclude from registry
+                continue;
+            }
+
+            active_holders.push_back(holder.clone());
+
+            // Pro-rata: holder_amount = total_amount * holder_shares / total_shares
+            // Use i128 arithmetic to avoid overflow
+            let holder_amount: i128 =
+                (total_amount * (holder_shares as i128)) / (total_shares as i128);
+
+            if holder_amount > 0 {
+                client.transfer(&contract_addr, &holder, &holder_amount);
+            }
+        }
+
+        // Update holder registry — removes any zero-balance holders
+        env.storage().instance().set(&DataKey::Holders, &active_holders);
+
+        let holder_count = active_holders.len();
+
+        EventDistributeDividends {
+            token,
+            total_amount,
+            holder_count,
+        }
+        .publish(&env);
+    }
+
+    /// Returns the current list of registered holders.
+    pub fn get_holders(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Holders)
+            .unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn get_shares(env: Env, owner: Address) -> u32 {
@@ -211,6 +323,8 @@ mod test {
         token::StellarAssetClient::new(&te.env, &te.token_id).mint(to, &amount);
     }
 
+    // ── Existing tests (unchanged) ──────────────────────────────────────
+
     #[test]
     fn test_init_and_query() {
         let te = setup();
@@ -306,5 +420,143 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         c.emergency_withdraw(&te.admin, &0);
+    }
+
+    // ── New tests for holder registry and distribute_dividends ──────────
+
+    #[test]
+    fn test_holders_registered_on_buy() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+
+        // Before any purchase, registry is empty
+        assert_eq!(c.get_holders().len(), 0);
+
+        c.buy_shares(&te.buyer, &10);
+        assert_eq!(c.get_holders().len(), 1);
+
+        // Second buy by same buyer — should NOT add duplicate
+        c.buy_shares(&te.buyer, &5);
+        assert_eq!(c.get_holders().len(), 1);
+    }
+
+    #[test]
+    fn test_multiple_holders_registered() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        let buyer2 = Address::generate(&te.env);
+        mint(&te, &te.buyer, 100_000);
+        mint(&te, &buyer2, 100_000);
+
+        c.buy_shares(&te.buyer, &10);
+        c.buy_shares(&buyer2, &20);
+
+        assert_eq!(c.get_holders().len(), 2);
+    }
+
+    #[test]
+    fn test_distribute_dividends_single_holder() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+
+        c.buy_shares(&te.buyer, &500); // buyer owns 500 / 1000 shares = 50%
+
+        // Mint dividend tokens to the contract
+        let dividend_amount: i128 = 10_000;
+        mint(&te, &te.contract_id, dividend_amount);
+
+        c.distribute_dividends(&te.token_id, &dividend_amount);
+
+        // buyer has 500/1000 shares → receives 5000
+        let token_client = token::TokenClient::new(&te.env, &te.token_id);
+        // buyer started with 100_000, paid 500*100=50_000, receives 5_000
+        assert_eq!(token_client.balance(&te.buyer), 100_000 - 50_000 + 5_000);
+    }
+
+    #[test]
+    fn test_distribute_dividends_multiple_holders() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        let buyer2 = Address::generate(&te.env);
+        mint(&te, &te.buyer, 100_000);
+        mint(&te, &buyer2, 100_000);
+
+        // buyer: 250 shares (25%), buyer2: 750 shares (75%)
+        c.buy_shares(&te.buyer, &250);
+        c.buy_shares(&buyer2, &750);
+
+        let dividend_amount: i128 = 10_000;
+        mint(&te, &te.contract_id, dividend_amount);
+
+        c.distribute_dividends(&te.token_id, &dividend_amount);
+
+        let token_client = token::TokenClient::new(&te.env, &te.token_id);
+
+        // buyer: 10000 * 250 / 1000 = 2500
+        assert_eq!(
+            token_client.balance(&te.buyer),
+            100_000 - 250 * 100 + 2_500
+        );
+        // buyer2: 10000 * 750 / 1000 = 7500
+        assert_eq!(
+            token_client.balance(&buyer2),
+            100_000 - 750 * 100 + 7_500
+        );
+    }
+
+    #[test]
+    fn test_distribute_cleans_up_zero_balance_holders() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        let buyer2 = Address::generate(&te.env);
+        mint(&te, &te.buyer, 100_000);
+        mint(&te, &buyer2, 100_000);
+
+        c.buy_shares(&te.buyer, &10);
+        c.buy_shares(&buyer2, &20);
+        assert_eq!(c.get_holders().len(), 2);
+
+        // Manually zero out buyer's balance to simulate a future sell/transfer
+        te.env.as_contract(&te.contract_id, || {
+            te.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Balance(te.buyer.clone()), &0u32);
+        });
+
+        let dividend_amount: i128 = 1_000;
+        mint(&te, &te.contract_id, dividend_amount);
+        c.distribute_dividends(&te.token_id, &dividend_amount);
+
+        // buyer had 0 shares — removed from registry
+        assert_eq!(c.get_holders().len(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Dividend amount must be positive")]
+    fn test_distribute_zero_amount() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        c.distribute_dividends(&te.token_id, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "No holders registered")]
+    fn test_distribute_no_holders() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        c.distribute_dividends(&te.token_id, &1000);
     }
 }
