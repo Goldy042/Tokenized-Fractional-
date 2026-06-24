@@ -8,6 +8,7 @@ import pinoHttp from 'pino-http';
 import { readFileSync, writeFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { cacheGet, cacheSet, cacheDel } from './cache.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PORT = process.env.PORT || 3001;
@@ -134,15 +135,19 @@ app.get('/api/rwa', (req, res) => {
   });
 });
 
-app.get('/api/rwa/:contractId', (req, res) => {
+app.get('/api/rwa/:contractId', async (req, res) => {
   const { contractId } = req.params;
+
+  const cached = await cacheGet(cacheKey(contractId));
+  if (cached) return res.json(cached);
+
   const data = loadData();
   const asset = data[contractId];
   if (!asset) return res.status(404).json({ error: 'Asset metadata not found' });
   res.json({ contractId, ...asset });
 });
 
-app.post('/api/rwa', adminAuth, writeLimiter, (req, res) => {
+app.post('/api/rwa', adminAuth, writeLimiter, async (req, res) => {
   const { contractId, ...metadata } = req.body;
 
   if (!contractId || !validateContractId(contractId)) {
@@ -171,7 +176,7 @@ app.post('/api/rwa', adminAuth, writeLimiter, (req, res) => {
   res.status(201).json({ contractId, ...data[contractId] });
 });
 
-app.delete('/api/rwa/:contractId', adminAuth, writeLimiter, (req, res) => {
+app.delete('/api/rwa/:contractId', adminAuth, writeLimiter, async (req, res) => {
   const { contractId } = req.params;
   const data = loadData();
   if (!data[contractId]) return res.status(404).json({ error: 'Asset metadata not found' });
@@ -195,6 +200,7 @@ app.use((err, req, res, _next) => {
 export { app };
 
 if (process.env.NODE_ENV !== 'test') {
+  import('./cache.js').then(({ initClient }) => initClient());
   app.listen(PORT, () => {
     logger.info({ port: PORT }, 'RWA Off-chain Metadata Backend started');
   });
