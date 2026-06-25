@@ -18,6 +18,8 @@ pub enum DataKey {
     Balance(Address),
     VestingSchedules(Address),
     Holders, // registry of all unique holder addresses
+    NextOrderId,
+    SellOrder(u64),
 }
 
 #[contracttype]
@@ -28,6 +30,36 @@ pub struct VestingSchedule {
     pub duration: u64,
     pub total_amount: u32,
     pub claimed_amount: u32,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct SellOrder {
+    pub seller: Address,
+    pub amount: u32,
+    pub price_per_share: i128,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct EventOrderPlaced {
+    order_id: u64,
+    seller: Address,
+    amount: u32,
+    price_per_share: i128,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct EventOrderCancelled {
+    order_id: u64,
+    seller: Address,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct EventOrderFilled {
+    order_id: u64,
+    buyer: Address,
+    amount: u32,
+    total_cost: i128,
 }
 
 #[contractevent(data_format = "vec")]
@@ -594,6 +626,108 @@ impl RwaMarketplace {
         }
         .publish(&env);
     }
+
+    /// List `amount` of the caller's liquid shares for sale at `price_per_share`.
+    /// Shares are escrowed in the contract until filled or cancelled.
+    pub fn place_sell_order(env: Env, seller: Address, amount: u32, price_per_share: i128) -> u64 {
+        seller.require_auth();
+
+        if amount == 0 {
+            panic!("Order amount must be positive");
+        }
+        if price_per_share <= 0 {
+            panic!("Order price must be positive");
+        }
+
+        let balance: u32 = env.storage().persistent()
+            .get(&DataKey::Balance(seller.clone())).unwrap_or(0);
+        if amount > balance {
+            panic!("Insufficient liquid shares to place order");
+        }
+
+        // Escrow: deduct from seller's liquid balance
+        env.storage().persistent()
+            .set(&DataKey::Balance(seller.clone()), &checked_sub_u32(balance, amount));
+
+        let order_id: u64 = env.storage().instance()
+            .get(&DataKey::NextOrderId).unwrap_or(0);
+        let next_id = checked_add_i128(order_id as i128, 1) as u64;
+        env.storage().instance().set(&DataKey::NextOrderId, &next_id);
+
+        env.storage().persistent().set(
+            &DataKey::SellOrder(order_id),
+            &SellOrder { seller: seller.clone(), amount, price_per_share },
+        );
+
+        EventOrderPlaced { order_id, seller, amount, price_per_share }.publish(&env);
+        order_id
+    }
+
+    /// Cancel an open sell order and return escrowed shares to the seller.
+    pub fn cancel_sell_order(env: Env, order_id: u64) {
+        let order: SellOrder = env.storage().persistent()
+            .get(&DataKey::SellOrder(order_id))
+            .unwrap_or_else(|| panic!("Order not found"));
+
+        order.seller.require_auth();
+
+        // Return escrowed shares
+        let balance: u32 = env.storage().persistent()
+            .get(&DataKey::Balance(order.seller.clone())).unwrap_or(0);
+        env.storage().persistent()
+            .set(&DataKey::Balance(order.seller.clone()), &checked_add_u32(balance, order.amount));
+
+        env.storage().persistent().remove(&DataKey::SellOrder(order_id));
+
+        EventOrderCancelled { order_id, seller: order.seller }.publish(&env);
+    }
+
+    /// Buy `amount` shares from an open sell order, paying the seller directly.
+    pub fn buy_from_order(env: Env, buyer: Address, order_id: u64, amount: u32) {
+        buyer.require_auth();
+
+        if amount == 0 {
+            panic!("Purchase amount must be positive");
+        }
+
+        let mut order: SellOrder = env.storage().persistent()
+            .get(&DataKey::SellOrder(order_id))
+            .unwrap_or_else(|| panic!("Order not found"));
+
+        if amount > order.amount {
+            panic!("Amount exceeds order size");
+        }
+
+        let total_cost = checked_mul_i128(order.price_per_share, amount as i128);
+
+        let token_id: Address = env.storage().instance()
+            .get(&DataKey::PaymentToken)
+            .expect("Contract not initialized: payment token");
+
+        token::TokenClient::new(&env, &token_id)
+            .transfer(&buyer, &order.seller, &total_cost);
+
+        // Credit buyer's liquid balance
+        let buyer_balance: u32 = env.storage().persistent()
+            .get(&DataKey::Balance(buyer.clone())).unwrap_or(0);
+        env.storage().persistent()
+            .set(&DataKey::Balance(buyer.clone()), &checked_add_u32(buyer_balance, amount));
+        Self::register_holder(&env, buyer.clone());
+
+        order.amount = checked_sub_u32(order.amount, amount);
+        if order.amount == 0 {
+            env.storage().persistent().remove(&DataKey::SellOrder(order_id));
+        } else {
+            env.storage().persistent().set(&DataKey::SellOrder(order_id), &order);
+        }
+
+        EventOrderFilled { order_id, buyer, amount, total_cost }.publish(&env);
+    }
+
+    /// Get an open sell order by id, returning None if it doesn't exist.
+    pub fn get_sell_order(env: Env, order_id: u64) -> Option<SellOrder> {
+        env.storage().persistent().get(&DataKey::SellOrder(order_id))
+    }
 }
 
 #[cfg(test)]
@@ -1096,6 +1230,164 @@ mod test {
     fn test_pre_init_emergency_withdraw() {
         let (_, client, _, admin) = pre_init_client();
         client.emergency_withdraw(&admin, &0);
+    }
+
+    // ── Secondary market / sell order tests ────────────────────────────
+
+    #[test]
+    fn test_place_and_get_sell_order() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 10_000);
+        c.buy_shares(&te.buyer, &10);
+
+        let order_id = c.place_sell_order(&te.buyer, &5, &200);
+        assert_eq!(order_id, 0);
+
+        let order = c.get_sell_order(&order_id).unwrap();
+        assert_eq!(order.seller, te.buyer);
+        assert_eq!(order.amount, 5);
+        assert_eq!(order.price_per_share, 200);
+
+        // Escrowed shares deducted from seller's liquid balance
+        assert_eq!(c.get_shares(&te.buyer), 5);
+    }
+
+    #[test]
+    fn test_cancel_sell_order_returns_shares() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 10_000);
+        c.buy_shares(&te.buyer, &10);
+
+        let order_id = c.place_sell_order(&te.buyer, &10, &150);
+        assert_eq!(c.get_shares(&te.buyer), 0);
+
+        c.cancel_sell_order(&order_id);
+        assert_eq!(c.get_shares(&te.buyer), 10);
+        assert!(c.get_sell_order(&order_id).is_none());
+    }
+
+    #[test]
+    fn test_buy_from_order_full_fill() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        let seller = Address::generate(&te.env);
+        let buyer2 = Address::generate(&te.env);
+        mint(&te, &seller, 10_000);
+        mint(&te, &buyer2, 50_000);
+
+        c.buy_shares(&seller, &10);
+        let order_id = c.place_sell_order(&seller, &10, &300);
+
+        let token_client = token::TokenClient::new(&te.env, &te.token_id);
+        let seller_before = token_client.balance(&seller);
+
+        c.buy_from_order(&buyer2, &order_id, &10);
+
+        // Order fully filled — removed
+        assert!(c.get_sell_order(&order_id).is_none());
+        // Buyer received shares
+        assert_eq!(c.get_shares(&buyer2), 10);
+        // Seller received payment: 10 * 300 = 3000
+        assert_eq!(token_client.balance(&seller), seller_before + 3_000);
+    }
+
+    #[test]
+    fn test_buy_from_order_partial_fill() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 10_000);
+
+        let buyer2 = Address::generate(&te.env);
+        mint(&te, &buyer2, 50_000);
+
+        c.buy_shares(&te.buyer, &10);
+        let order_id = c.place_sell_order(&te.buyer, &10, &200);
+
+        c.buy_from_order(&buyer2, &order_id, &4); // partial fill
+
+        let remaining = c.get_sell_order(&order_id).unwrap();
+        assert_eq!(remaining.amount, 6);
+        assert_eq!(c.get_shares(&buyer2), 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "Order amount must be positive")]
+    fn test_place_sell_order_zero_amount() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 10_000);
+        c.buy_shares(&te.buyer, &10);
+        c.place_sell_order(&te.buyer, &0, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Order price must be positive")]
+    fn test_place_sell_order_zero_price() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 10_000);
+        c.buy_shares(&te.buyer, &10);
+        c.place_sell_order(&te.buyer, &5, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient liquid shares")]
+    fn test_place_sell_order_insufficient_shares() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 10_000);
+        c.buy_shares(&te.buyer, &5);
+        c.place_sell_order(&te.buyer, &10, &100); // only owns 5
+    }
+
+    #[test]
+    #[should_panic(expected = "Order not found")]
+    fn test_cancel_nonexistent_order() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        c.cancel_sell_order(&99);
+    }
+
+    #[test]
+    #[should_panic(expected = "Amount exceeds order size")]
+    fn test_buy_from_order_exceeds_amount() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 10_000);
+        let buyer2 = Address::generate(&te.env);
+        mint(&te, &buyer2, 50_000);
+
+        c.buy_shares(&te.buyer, &5);
+        let order_id = c.place_sell_order(&te.buyer, &5, &200);
+        c.buy_from_order(&buyer2, &order_id, &10); // only 5 available
+    }
+
+    #[test]
+    fn test_order_ids_increment() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &30);
+
+        let id0 = c.place_sell_order(&te.buyer, &5, &100);
+        let id1 = c.place_sell_order(&te.buyer, &5, &100);
+        let id2 = c.place_sell_order(&te.buyer, &5, &100);
+        assert_eq!(id0, 0);
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
     }
 }
 // --- TIMELOCK MODULE ---
