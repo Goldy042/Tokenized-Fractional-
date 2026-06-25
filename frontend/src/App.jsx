@@ -9,6 +9,7 @@ import Badge from './components/Badge/Badge';
 import Alert from './components/Alert/Alert';
 import Skeleton from './components/Skeleton/Skeleton';
 import Spinner from './components/Spinner/Spinner';
+import AdminPage from './components/AdminPage/AdminPage';
 import styles from './App.module.css';
 
 import { useWalletStore } from './store/useWalletStore';
@@ -52,6 +53,9 @@ function App() {
   const [theme, setTheme] = useState(() => {
     return localStorage.getItem('theme') || 'dark';
   });
+
+  // View state: 'marketplace' | 'admin'
+  const [view, setView] = useState('marketplace');
 
   // ── Theme ──────────────────────────────────────────────────────────────────
   useEffect(() => {
@@ -243,6 +247,29 @@ function App() {
         </div>
       </header>
 
+      {/* Tab Navigation */}
+      <nav className={styles.tabs}>
+        <button
+          className={`${styles.tab} ${view === 'marketplace' ? styles.tabActive : ''}`}
+          onClick={() => setView('marketplace')}
+        >
+          Marketplace
+        </button>
+        <button
+          className={`${styles.tab} ${view === 'admin' ? styles.tabActive : ''}`}
+          onClick={() => setView('admin')}
+        >
+          Admin
+        </button>
+      </nav>
+
+      {view === 'admin' ? (
+        <AdminPage
+          publicKey={publicKey}
+          onDisconnect={() => setView('marketplace')}
+        />
+      ) : (
+        <>
       {/* Wallet errors (connection issues) */}
       {walletError && (
         <Alert variant="error">
@@ -341,6 +368,8 @@ function App() {
             </div>
           )}
         </Card>
+      )}
+        </>
       )}
     </div>
   );
