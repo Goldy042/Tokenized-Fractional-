@@ -844,3 +844,189 @@ mod timelock_tests {
         assert_eq!(client.is_paused(), true);
     }
 }
+
+// ── Property-based / fuzz tests using proptest ─────────────────────────
+
+#[cfg(test)]
+mod property_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use soroban_sdk::testutils::Address as _;
+
+    const NUM_BUYERS: usize = 5;
+    const INIT_TOTAL: u32 = 1000;
+    const INIT_PRICE: i128 = 100;
+
+    /// Operations that can be fuzzed.
+    #[derive(Clone, Debug)]
+    enum Op {
+        BuyShares { buyer_idx: usize, shares: u32 },
+        Pause,
+        Unpause,
+        SetPrice(i128),
+        SetTotalShares(u32),
+    }
+
+    fn arb_op() -> impl Strategy<Value = Op> {
+        prop_oneof![
+            4 => (0..NUM_BUYERS, 1..INIT_TOTAL / 4).prop_map(|(idx, s)| Op::BuyShares { buyer_idx: idx, shares: s }),
+            1 => Just(Op::Pause),
+            1 => Just(Op::Unpause),
+            1 => (1i128..10_000i128).prop_map(Op::SetPrice),
+            1 => (INIT_TOTAL..INIT_TOTAL * 5).prop_map(Op::SetTotalShares),
+        ]
+    }
+
+    proptest! {
+        /// Invariant: sum(all holder balances) + available == total at all times.
+        #[test]
+        fn test_contract_invariants(ops in prop::collection::vec(arb_op(), 1..30)) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let token_id = env
+                .register_stellar_asset_contract_v2(admin.clone())
+                .address();
+            let contract_id = env.register(RwaMarketplace, ());
+            let client = RwaMarketplaceClient::new(&env, &contract_id);
+
+            // Create buyers with sufficient funds
+            let buyers: [Address; NUM_BUYERS] = core::array::from_fn(|_| Address::generate(&env));
+            for b in buyers.iter() {
+                token::StellarAssetClient::new(&env, &token_id).mint(b, &1_000_000_000);
+            }
+
+            client.init(&admin, &token_id, &INIT_PRICE, &INIT_TOTAL);
+
+            let mut balances = [0u32; NUM_BUYERS];
+            let mut available = INIT_TOTAL;
+            let mut total = INIT_TOTAL;
+            let mut paused = false;
+
+            for op in ops {
+                match op {
+                    Op::BuyShares { buyer_idx, shares } => {
+                        if paused || shares > available {
+                            continue;
+                        }
+                        client.buy_shares(&buyers[buyer_idx], &shares);
+                        balances[buyer_idx] += shares;
+                        available -= shares;
+                    }
+                    Op::Pause => {
+                        client.pause();
+                        paused = true;
+                    }
+                    Op::Unpause => {
+                        client.unpause();
+                        paused = false;
+                    }
+                    Op::SetPrice(new_price) => {
+                        if new_price <= 0 {
+                            continue;
+                        }
+                        client.set_price(&new_price);
+                    }
+                    Op::SetTotalShares(new_total) => {
+                        let issued = total - available;
+                        if new_total < available || new_total < issued {
+                            continue;
+                        }
+                        let new_available = new_total - issued;
+                        client.set_total_shares(&new_total);
+                        total = new_total;
+                        available = new_available;
+                    }
+                }
+
+                // Invariant: sum(balances) + available == total
+                let sum_b: u32 = balances.iter().sum();
+                prop_assert_eq!(
+                    sum_b + available,
+                    total,
+                    "core invariant: sum(balances)={} + available={} != total={}",
+                    sum_b, available, total
+                );
+                // Invariant: available never exceeds total
+                prop_assert!(available <= total, "available={} > total={}", available, total);
+                // Invariant: no balance exceeds total
+                for &b in &balances {
+                    prop_assert!(b <= total, "balance={} > total={}", b, total);
+                }
+                // On-chain state matches tracked state
+                prop_assert_eq!(client.get_total_shares(), total);
+                prop_assert_eq!(client.get_available_shares(), available);
+                prop_assert_eq!(client.is_paused(), paused);
+            }
+        }
+
+        /// Invariant: pause/unpause cycles toggle correctly.
+        /// No buy_shares succeeds while paused.
+        #[test]
+        fn test_pause_unpause_cycles(pauses in prop::collection::vec(any::<bool>(), 1..20)) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let token_id = env
+                .register_stellar_asset_contract_v2(admin.clone())
+                .address();
+            let contract_id = env.register(RwaMarketplace, ());
+            let client = RwaMarketplaceClient::new(&env, &contract_id);
+            client.init(&admin, &token_id, &INIT_PRICE, &INIT_TOTAL);
+
+            for should_pause in pauses {
+                if should_pause {
+                    client.pause();
+                    prop_assert!(client.is_paused());
+                } else {
+                    client.unpause();
+                    prop_assert!(!client.is_paused());
+                }
+            }
+        }
+
+        /// Invariant: for sequential buys by a single user,
+        /// available + total_bought == INIT_TOTAL and
+        /// total_shares remains unchanged.
+        #[test]
+        fn test_buy_sequences_invariant(buys in prop::collection::vec(1u32..200u32, 1..20)) {
+            let env = Env::default();
+            env.mock_all_auths();
+            let admin = Address::generate(&env);
+            let token_id = env
+                .register_stellar_asset_contract_v2(admin.clone())
+                .address();
+            let contract_id = env.register(RwaMarketplace, ());
+            let client = RwaMarketplaceClient::new(&env, &contract_id);
+
+            let buyer = Address::generate(&env);
+            token::StellarAssetClient::new(&env, &token_id).mint(&buyer, &1_000_000_000);
+            client.init(&admin, &token_id, &INIT_PRICE, &INIT_TOTAL);
+
+            let mut total_bought = 0u32;
+
+            for shares in buys {
+                let available = client.get_available_shares();
+                if shares > available {
+                    continue;
+                }
+                client.buy_shares(&buyer, &shares);
+                total_bought += shares;
+
+                // available + total_bought == INIT_TOTAL
+                prop_assert_eq!(
+                    client.get_available_shares() + total_bought,
+                    INIT_TOTAL,
+                    "available={} + bought={} != {}",
+                    client.get_available_shares(),
+                    total_bought,
+                    INIT_TOTAL
+                );
+                // holder balance matches total bought
+                prop_assert_eq!(client.get_shares(&buyer), total_bought);
+                // total_shares never changes
+                prop_assert_eq!(client.get_total_shares(), INIT_TOTAL);
+            }
+        }
+    }
+}
