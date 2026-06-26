@@ -18,6 +18,7 @@ pub enum DataKey {
     Balance(Address),
     VestingSchedules(Address),
     Holders, // registry of all unique holder addresses
+    Allowance(Address, Address), // (owner, spender) -> approved amount
 }
 
 #[contracttype]
@@ -75,6 +76,20 @@ pub struct EventSetPrice {
 pub struct EventSetTotalShares {
     old_total: u32,
     new_total: u32,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct EventTransferShares {
+    from: Address,
+    to: Address,
+    amount: u32,
+}
+
+#[contractevent(data_format = "vec")]
+pub struct EventApproveShares {
+    owner: Address,
+    spender: Address,
+    amount: u32,
 }
 
 // ── OVERFLOW-SAFE MATH HELPERS ──────────────────────────────────────
@@ -594,12 +609,107 @@ impl RwaMarketplace {
         }
         .publish(&env);
     }
+
+    /// Approve `spender` to transfer up to `amount` of `owner`'s shares via
+    /// `transfer_shares_from`. Overwrites any previously approved amount.
+    /// Requires `owner`'s authorization.
+    pub fn approve_shares(env: Env, owner: Address, spender: Address, amount: u32) {
+        owner.require_auth();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Allowance(owner.clone(), spender.clone()), &amount);
+
+        EventApproveShares { owner, spender, amount }.publish(&env);
+    }
+
+    /// Returns the amount `spender` is currently allowed to transfer on
+    /// behalf of `owner`.
+    pub fn allowance(env: Env, owner: Address, spender: Address) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(owner, spender))
+            .unwrap_or(0)
+    }
+
+    /// Transfer `amount` shares from `from` to `to`. Requires `from`'s
+    /// authorization.
+    pub fn transfer_shares(env: Env, from: Address, to: Address, amount: u32) {
+        from.require_auth();
+        Self::do_transfer_shares(&env, from, to, amount);
+    }
+
+    /// Transfer `amount` shares from `from` to `to` on `spender`'s behalf,
+    /// drawing down a previously approved allowance. Requires `spender`'s
+    /// authorization.
+    pub fn transfer_shares_from(env: Env, spender: Address, from: Address, to: Address, amount: u32) {
+        spender.require_auth();
+
+        let allowance_key = DataKey::Allowance(from.clone(), spender.clone());
+        let current_allowance: u32 = env
+            .storage()
+            .persistent()
+            .get(&allowance_key)
+            .unwrap_or(0);
+
+        if amount > current_allowance {
+            panic!("Insufficient allowance");
+        }
+
+        let new_allowance = checked_sub_u32(current_allowance, amount);
+        env.storage().persistent().set(&allowance_key, &new_allowance);
+
+        Self::do_transfer_shares(&env, from, to, amount);
+    }
+
+    fn do_transfer_shares(env: &Env, from: Address, to: Address, amount: u32) {
+        if env.storage().instance().get(&DataKey::Paused).unwrap_or(false) {
+            panic!("Marketplace is paused");
+        }
+
+        if amount == 0 {
+            panic!("Must transfer at least 1 share");
+        }
+
+        if from == to {
+            panic!("Cannot transfer to self");
+        }
+
+        let from_balance: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(from.clone()))
+            .unwrap_or(0);
+
+        if amount > from_balance {
+            panic!("Insufficient balance");
+        }
+
+        let new_from_balance = checked_sub_u32(from_balance, amount);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(from.clone()), &new_from_balance);
+
+        let to_balance: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Balance(to.clone()))
+            .unwrap_or(0);
+        let new_to_balance = checked_add_u32(to_balance, amount);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Balance(to.clone()), &new_to_balance);
+
+        Self::register_holder(env, to.clone());
+
+        EventTransferShares { from, to, amount }.publish(env);
+    }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger as _}, token, Env};
+    use soroban_sdk::{testutils::{Address as _, Events as _, Ledger as _}, token, Env};
 
     struct TestEnv {
         env: Env,
@@ -863,6 +973,268 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         c.distribute_dividends(&te.token_id, &1000);
+    }
+
+    // ── Tests for transfer_shares, transfer_shares_from, approve_shares ──
+
+    #[test]
+    fn test_transfer_shares_basic() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+
+        c.buy_shares(&te.buyer, &50);
+
+        let buyer2 = Address::generate(&te.env);
+        c.transfer_shares(&te.buyer, &buyer2, &20);
+
+        assert_eq!(c.get_shares(&te.buyer), 30);
+        assert_eq!(c.get_shares(&buyer2), 20);
+    }
+
+    #[test]
+    fn test_transfer_shares_registers_new_holder() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+
+        c.buy_shares(&te.buyer, &50);
+        assert_eq!(c.get_holders().len(), 1);
+
+        let buyer2 = Address::generate(&te.env);
+        c.transfer_shares(&te.buyer, &buyer2, &20);
+
+        assert_eq!(c.get_holders().len(), 2);
+    }
+
+    #[test]
+    fn test_transfer_shares_emits_event() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &50);
+
+        let buyer2 = Address::generate(&te.env);
+        c.transfer_shares(&te.buyer, &buyer2, &20);
+
+        let events = te.env.events().all();
+        assert!(events.events().len() > 0, "expected at least one event to be published");
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient balance")]
+    fn test_transfer_shares_insufficient_balance() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &10);
+
+        let buyer2 = Address::generate(&te.env);
+        c.transfer_shares(&te.buyer, &buyer2, &20);
+    }
+
+    #[test]
+    #[should_panic(expected = "Must transfer at least 1 share")]
+    fn test_transfer_shares_zero_amount() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &10);
+
+        let buyer2 = Address::generate(&te.env);
+        c.transfer_shares(&te.buyer, &buyer2, &0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Cannot transfer to self")]
+    fn test_transfer_shares_to_self() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &10);
+
+        c.transfer_shares(&te.buyer, &te.buyer, &5);
+    }
+
+    #[test]
+    #[should_panic(expected = "Marketplace is paused")]
+    fn test_transfer_shares_when_paused() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &10);
+
+        c.pause();
+
+        let buyer2 = Address::generate(&te.env);
+        c.transfer_shares(&te.buyer, &buyer2, &5);
+    }
+
+    #[test]
+    fn test_approve_and_allowance() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        let spender = Address::generate(&te.env);
+        assert_eq!(c.allowance(&te.buyer, &spender), 0);
+
+        c.approve_shares(&te.buyer, &spender, &100);
+        assert_eq!(c.allowance(&te.buyer, &spender), 100);
+    }
+
+    #[test]
+    fn test_approve_overwrites_previous_allowance() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        let spender = Address::generate(&te.env);
+        c.approve_shares(&te.buyer, &spender, &100);
+        c.approve_shares(&te.buyer, &spender, &30);
+
+        assert_eq!(c.allowance(&te.buyer, &spender), 30);
+    }
+
+    #[test]
+    fn test_approve_emits_event() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+
+        let spender = Address::generate(&te.env);
+        c.approve_shares(&te.buyer, &spender, &100);
+
+        let events = te.env.events().all();
+        assert!(events.events().len() > 0, "expected at least one event to be published");
+    }
+
+    #[test]
+    fn test_transfer_shares_from_basic() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &50);
+
+        let spender = Address::generate(&te.env);
+        let recipient = Address::generate(&te.env);
+
+        c.approve_shares(&te.buyer, &spender, &30);
+        c.transfer_shares_from(&spender, &te.buyer, &recipient, &20);
+
+        assert_eq!(c.get_shares(&te.buyer), 30);
+        assert_eq!(c.get_shares(&recipient), 20);
+        assert_eq!(c.allowance(&te.buyer, &spender), 10);
+    }
+
+    #[test]
+    fn test_transfer_shares_from_registers_new_holder() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &50);
+
+        let spender = Address::generate(&te.env);
+        let recipient = Address::generate(&te.env);
+
+        c.approve_shares(&te.buyer, &spender, &30);
+        c.transfer_shares_from(&spender, &te.buyer, &recipient, &20);
+
+        assert_eq!(c.get_holders().len(), 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient allowance")]
+    fn test_transfer_shares_from_insufficient_allowance() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &50);
+
+        let spender = Address::generate(&te.env);
+        let recipient = Address::generate(&te.env);
+
+        c.approve_shares(&te.buyer, &spender, &10);
+        c.transfer_shares_from(&spender, &te.buyer, &recipient, &20);
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient allowance")]
+    fn test_transfer_shares_from_no_allowance() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &50);
+
+        let spender = Address::generate(&te.env);
+        let recipient = Address::generate(&te.env);
+
+        c.transfer_shares_from(&spender, &te.buyer, &recipient, &5);
+    }
+
+    #[test]
+    #[should_panic(expected = "Insufficient balance")]
+    fn test_transfer_shares_from_exceeds_balance() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &10);
+
+        let spender = Address::generate(&te.env);
+        let recipient = Address::generate(&te.env);
+
+        // Allowance exceeds the owner's actual balance.
+        c.approve_shares(&te.buyer, &spender, &50);
+        c.transfer_shares_from(&spender, &te.buyer, &recipient, &20);
+    }
+
+    #[test]
+    #[should_panic(expected = "Marketplace is paused")]
+    fn test_transfer_shares_from_when_paused() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &10);
+
+        let spender = Address::generate(&te.env);
+        let recipient = Address::generate(&te.env);
+        c.approve_shares(&te.buyer, &spender, &10);
+
+        c.pause();
+        c.transfer_shares_from(&spender, &te.buyer, &recipient, &5);
+    }
+
+    #[test]
+    fn test_transfer_shares_then_dividends_use_new_balances() {
+        let te = setup();
+        let c = client(&te);
+        c.init(&te.admin, &te.token_id, &100, &1000);
+        mint(&te, &te.buyer, 100_000);
+        c.buy_shares(&te.buyer, &1000); // buyer owns 100% of shares
+
+        let buyer2 = Address::generate(&te.env);
+        c.transfer_shares(&te.buyer, &buyer2, &500); // now split 50/50
+
+        let dividend_amount: i128 = 10_000;
+        mint(&te, &te.contract_id, dividend_amount);
+        c.distribute_dividends(&te.token_id, &dividend_amount);
+
+        let token_client = token::TokenClient::new(&te.env, &te.token_id);
+        assert_eq!(token_client.balance(&te.buyer), 100_000 - 100_000 + 5_000);
+        assert_eq!(token_client.balance(&buyer2), 5_000);
     }
 
     // ── Tests for set_price and set_total_shares ────────────────────────
