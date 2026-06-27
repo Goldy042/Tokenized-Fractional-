@@ -85,6 +85,10 @@ graph TB
 └── README.md
 ```
 
+## Documentation
+
+- [Architecture Overview & Diagrams](docs/architecture.md)
+
 ## Prerequisites
 
 - Node.js (v18 or higher)
@@ -176,6 +180,19 @@ npm run dev
 ```
 
 Open `http://localhost:5173`, connect your Freighter wallet, and buy shares.
+
+### 7. Run with Nginx Proxy (Optional)
+
+To run the application with rate limiting and basic WAF/DDoS protection, you can use the provided Nginx configuration. Ensure Nginx is installed on your system.
+
+```bash
+# Start Nginx using the provided configuration
+nginx -c $(pwd)/nginx/nginx.conf
+```
+
+This will start an Nginx server on `http://localhost:80` that proxies requests:
+- `/api/*` -> Backend (`http://localhost:3001`) with rate limiting (10 req/s)
+- `/*` -> Frontend (`http://localhost:5173`)
 
 ## Smart Contract API
 
