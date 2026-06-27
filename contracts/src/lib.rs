@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Tokenized Fractional RWA Marketplace Contributors
+// SPDX-License-Identifier: MIT
+
 #![no_std]
 use soroban_sdk::{
     contract, contractevent, contractimpl, contracttype, token, Address, Bytes, Env, Vec,

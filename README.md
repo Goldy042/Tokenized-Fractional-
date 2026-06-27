@@ -1,5 +1,7 @@
 # Tokenized Fractional Real-World Assets (RWA) Marketplace
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A full-stack decentralized application (dApp) built on the **Stellar Network** using **Soroban Smart Contracts**. This marketplace allows administrators to tokenize real-world assets into fractional shares for users to purchase.
 
 ## Project Structure
@@ -139,3 +141,7 @@ Open `http://localhost:5173`, connect your Freighter wallet, and buy shares.
 | `GET` | `/api/rwa/:contractId` | No | Get asset metadata |
 | `POST` | `/api/rwa` | `x-api-key` | Create/update asset |
 | `DELETE` | `/api/rwa/:contractId` | `x-api-key` | Delete asset |
+
+## License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.

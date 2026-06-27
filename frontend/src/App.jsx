@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Tokenized Fractional RWA Marketplace Contributors
+// SPDX-License-Identifier: MIT
+
 import React, { useState, useEffect, useMemo } from 'react';
 import { Networks, nativeToScVal } from '@stellar/stellar-sdk';
 
