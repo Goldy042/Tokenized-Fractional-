@@ -1,23 +1,22 @@
-import React, { useState, useEffect, useRef } from 'react';
-import { signTransaction } from '@stellar/freighter-api';
-import { rpc, TransactionBuilder, Networks, Contract, nativeToScVal } from '@stellar/stellar-sdk';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import { Networks, nativeToScVal } from '@stellar/stellar-sdk';
 
-import Button from './components/Button/Button';
+import Header from './components/Header/Header';
+import Navbar from './components/Navbar/Navbar';
 import Card from './components/Card/Card';
-import Input from './components/Input/Input';
-import Badge from './components/Badge/Badge';
 import Alert from './components/Alert/Alert';
 import Skeleton from './components/Skeleton/Skeleton';
-import Spinner from './components/Spinner/Spinner';
 import AssetGrid from './components/AssetGrid/AssetGrid';
 import AdminPage from './components/AdminPage/AdminPage';
 import PortfolioPage from './components/PortfolioPage/PortfolioPage';
+import BuyShares from './components/BuyShares/BuyShares';
 import ToastContainer from './components/Toast/Toast';
 import styles from './App.module.css';
 
 import { useWalletStore } from './store/useWalletStore';
 import { useAssetStore } from './store/useAssetStore';
 import { useToastStore } from './store/useToastStore';
+import { useSorobanRead, useSorobanWrite } from './hooks/useSoroban';
 import useTransactionStatus from './hooks/useTransactionStatus';
 
 const CONTRACT_ID = import.meta.env.VITE_CONTRACT_ID || 'C...';
@@ -35,28 +34,22 @@ function App() {
     disconnect,
     checkConnection,
     setShares,
-    setWalletError,
     clearWalletError,
   } = useWalletStore();
 
   const {
+    assetMeta,
+    isFetchingMeta,
     assets,
     isFetchingAssets,
     assetsError,
+    fetchMetadata,
     fetchAllAssets,
     clearMeta,
     clearAssets,
   } = useAssetStore();
 
   // ── Local UI state (not global — scoped to this component) ────────────────
-  const [buyAmount, setBuyAmount] = useState(1);
-
-  // Granular loading states
-  const [loadingMeta, setLoadingMeta] = useState(false);
-
-  const [error, setError] = useState(null);
-  const [txError, setTxError] = useState(null);
-  const [txResult, setTxResult] = useState(null);
   const [lastTxHash, setLastTxHash] = useState(null);
   const addToast = useToastStore((s) => s.addToast);
   const removeToast = useToastStore((s) => s.removeToast);
@@ -92,7 +85,6 @@ function App() {
         pendingToastRef.current = null;
       }
       addToast({ message: 'Transaction confirmed', type: 'success', txHash: lastTxHash });
-      setTxResult(null);
       fetchShares();
     } else if (txStatus === 'failed') {
       notifiedRef.current[lastTxHash] = true;
@@ -101,13 +93,10 @@ function App() {
         pendingToastRef.current = null;
       }
       addToast({ message: 'Transaction failed', type: 'error', txHash: lastTxHash });
-      setTxError(null);
     }
   }, [lastTxHash, txStatus]);
 
   // ── On mount: re-validate Freighter session ────────────────────────────────
-  // The persisted publicKey lets the UI render instantly; checkConnection()
-  // then confirms the Freighter session is still live in the background.
   useEffect(() => {
     checkConnection();
   }, [checkConnection]);
@@ -136,7 +125,7 @@ function App() {
     },
     onError: (err) => {
       console.error('Error fetching shares:', err);
-      setError('Failed to fetch share balance.');
+      addToast({ message: 'Failed to fetch share balance.', type: 'error' });
     },
   });
 
@@ -160,7 +149,6 @@ function App() {
   // ── Wallet actions ─────────────────────────────────────────────────────────
   const connectWallet = async () => {
     clearWalletError();
-    setTxError(null);
     await connect();
   };
 
@@ -168,20 +156,16 @@ function App() {
     disconnect();
     clearMeta();
     clearAssets();
-    setTxResult(null);
-    setTxError(null);
   };
 
   // ── Transactions ───────────────────────────────────────────────────────────
-  const handleBuyShares = async () => {
+  const handleBuyShares = async (buyAmount) => {
     if (!publicKey) return;
     if (buyAmount < 1) {
       addToast({ message: 'Must buy at least 1 share', type: 'error' });
       return;
     }
 
-    setError(null);
-    setTxResult(null);
     setLastTxHash(null);
 
     try {
@@ -206,8 +190,6 @@ function App() {
         msg = 'Not enough shares available.';
       }
       addToast({ message: msg, type: 'error' });
-    } finally {
-      setLoadingBuy(false);
     }
   };
 
@@ -215,67 +197,20 @@ function App() {
 
   return (
     <div className={styles.container}>
-      <header className={styles.header}>
-        <div className={styles.titleArea}>
-          <div className={styles.titleRow}>
-            <h1 className={styles.title}>RWA Marketplace</h1>
-            <Badge variant={isTestnet ? 'success' : 'danger'}>
-              {isTestnet ? 'TESTNET' : 'MAINNET'}
-            </Badge>
-          </div>
-        </div>
-        <div className={styles.walletArea}>
-          <button
-            onClick={toggleTheme}
-            className={styles.themeToggle}
-            title={theme === 'dark' ? 'Switch to Light Theme' : 'Switch to Dark Theme'}
-            aria-label="Toggle theme"
-          >
-            {theme === 'dark' ? (
-              <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line></svg>
-            ) : (
-              <svg viewBox="0 0 24 24"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
-            )}
-          </button>
+      <Header
+        publicKey={publicKey}
+        isConnecting={isConnecting}
+        isTestnet={isTestnet}
+        theme={theme}
+        onConnect={connectWallet}
+        onDisconnect={disconnectWallet}
+        onToggleTheme={toggleTheme}
+      />
 
-          {!publicKey ? (
-            <Button onClick={connectWallet} variant="success" loading={isConnecting}>
-              {isConnecting ? 'Connecting…' : 'Connect Freighter'}
-            </Button>
-          ) : (
-            <div className={styles.walletInfo}>
-              <span className={styles.publicKey} title={publicKey}>
-                {publicKey}
-              </span>
-              <Button onClick={disconnectWallet} variant="danger">
-                Disconnect
-              </Button>
-            </div>
-          )}
-        </div>
-      </header>
-
-      {/* Tab Navigation */}
-      <nav className={styles.tabs}>
-        <button
-          className={`${styles.tab} ${view === 'marketplace' ? styles.tabActive : ''}`}
-          onClick={() => setView('marketplace')}
-        >
-          Marketplace
-        </button>
-        <button
-          className={`${styles.tab} ${view === 'portfolio' ? styles.tabActive : ''}`}
-          onClick={() => setView('portfolio')}
-        >
-          Portfolio
-        </button>
-        <button
-          className={`${styles.tab} ${view === 'admin' ? styles.tabActive : ''}`}
-          onClick={() => setView('admin')}
-        >
-          Admin
-        </button>
-      </nav>
+      <Navbar
+        activeView={view}
+        onNavigate={setView}
+      />
 
       {view === 'portfolio' ? (
         <PortfolioPage />
@@ -303,7 +238,7 @@ function App() {
       )}
 
       {/* ── Asset Metadata Card ─────────────────────────────────────────── */}
-      {loadingMeta ? (
+      {isFetchingMeta ? (
         <Card>
           <div className={styles.assetImageWrapper}>
             <Skeleton variant="rect" height="100%" style={{ borderRadius: 'var(--radius-sm)' }} />
@@ -348,41 +283,12 @@ function App() {
 
       {/* ── Holdings + Buy Card ─────────────────────────────────────────── */}
       {publicKey && (
-        <Card>
-          <div className={styles.holdingsRow}>
-            <span className={styles.holdingsLabel}>Your Share Balance</span>
-            {loadingShares ? (
-              <span className={styles.holdingsValueLoading}>
-                <Spinner size="sm" label="Fetching share balance…" />
-                <Skeleton variant="text" width="3rem" height="1.6em" />
-              </span>
-            ) : (
-              <span className={styles.holdingsValue}>{shares}</span>
-            )}
-          </div>
-          <hr className={styles.divider} />
-          <h3 className={styles.purchaseHeader}>Buy Fractional Shares</h3>
-          <div className={styles.purchaseRow}>
-            <Input
-              id="buy-amount-input"
-              type="number"
-              value={buyAmount}
-              onChange={(e) => setBuyAmount(Math.max(1, Number(e.target.value)))}
-              min="1"
-              disabled={loadingBuy}
-              className={styles.buyInput}
-            />
-            <Button onClick={handleBuyShares} loading={loadingBuy} variant="primary">
-              {loadingBuy ? 'Processing…' : 'Buy Shares'}
-            </Button>
-          </div>
-          {loadingBuy && (
-            <div className={styles.buyLoadingHint}>
-              <Spinner size="sm" label="Processing transaction…" />
-              <span>Submitting transaction to the network…</span>
-            </div>
-          )}
-        </Card>
+        <BuyShares
+          shares={shares}
+          loadingShares={loadingShares}
+          loadingBuy={loadingBuy}
+          onBuy={handleBuyShares}
+        />
       )}
         </>
       )}
