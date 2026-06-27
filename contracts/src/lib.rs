@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractevent, contractimpl, contracttype, token, Address, Bytes, Env, Vec,
+    contract, contractevent, contractimpl, contracttype, token, Address, Bytes, BytesN, Env, Vec,
 };
 
 #[contract]
@@ -19,6 +19,9 @@ pub enum DataKey {
     VestingSchedules(Address),
     Holders, // registry of all unique holder addresses
     MetadataUri,
+    Whitelisted(Address),
+    NextOrderId,
+    SellOrder(u64),
 }
 
 #[contracttype]
@@ -172,6 +175,16 @@ impl RwaMarketplace {
             panic!("Marketplace is paused");
         }
 
+        // Check whitelist for KYC compliance
+        if !env
+            .storage()
+            .persistent()
+            .get(&DataKey::Whitelisted(buyer.clone()))
+            .unwrap_or(false)
+        {
+            panic!("Buyer is not whitelisted");
+        }
+
         let available: u32 = env
             .storage()
             .instance()
@@ -188,7 +201,7 @@ impl RwaMarketplace {
 
         let price: i128 = env.storage().instance().get(&DataKey::PricePerShare)
             .expect("Contract not initialized: price");
-        let total_cost = price * (shares as i128);
+        let total_cost = checked_mul_i128(price, shares as i128);
 
         let admin: Address = env.storage().instance().get(&DataKey::Admin)
             .expect("Contract not initialized: admin");
@@ -458,7 +471,7 @@ impl RwaMarketplace {
         claimer.require_auth();
 
         let now = env.ledger().timestamp();
-        let mut schedules = Self::load_vesting_schedules(&env, &claimer);
+        let schedules = Self::load_vesting_schedules(&env, &claimer);
 
         let mut total_claimable: u32 = 0;
         let mut updated_schedules: Vec<VestingSchedule> = Vec::new(&env);
@@ -936,6 +949,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &10);
         mint(&te, &te.buyer, 100000);
+        c.add_to_whitelist(&te.buyer);
         c.buy_shares(&te.buyer, &20);
     }
 
@@ -945,6 +959,7 @@ mod test {
         let te = setup();
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
+        c.add_to_whitelist(&te.buyer);
         c.buy_shares(&te.buyer, &0);
     }
 
@@ -1203,6 +1218,7 @@ mod test {
         // Use very high price that will overflow when multiplied by shares
         c.init(&te.admin, &te.token_id, &i128::MAX, &1000);
         mint(&te, &te.buyer, i128::MAX);
+        c.add_to_whitelist(&te.buyer);
         
         // This should panic because price * shares overflows
         c.buy_shares(&te.buyer, &2);
@@ -1215,6 +1231,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
         
         // Buy more shares than available (caught by logic check, not arithmetic)
         c.buy_shares(&te.buyer, &2000);
@@ -1227,6 +1244,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &1, &u32::MAX);
         mint(&te, &te.buyer, i128::MAX);
+        c.add_to_whitelist(&te.buyer);
         
         // Manually set high balance to test the checked_add_u32 in balance calculation
         te.env.as_contract(&te.contract_id, || {
@@ -1246,6 +1264,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
         
         c.buy_shares(&te.buyer, &500);
         
@@ -1264,6 +1283,7 @@ mod test {
         let c = client(&te);
         c.init(&te.admin, &te.token_id, &100, &1000);
         mint(&te, &te.buyer, 100_000);
+        c.add_to_whitelist(&te.buyer);
         
         // Buy some shares to create issued_shares
         c.buy_shares(&te.buyer, &600);
@@ -1288,7 +1308,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Contract not initialized")]
+    #[should_panic(expected = "Buyer is not whitelisted")]
     fn test_pre_init_buy_shares() {
         let (env, client, _, _) = pre_init_client();
         let buyer = Address::generate(&env);
@@ -1533,6 +1553,11 @@ mod property_tests {
 
             client.init(&admin, &token_id, &INIT_PRICE, &INIT_TOTAL);
 
+            // Whitelist all buyers (must be after init so Admin is set)
+            for b in buyers.iter() {
+                client.add_to_whitelist(b);
+            }
+
             let mut balances = [0u32; NUM_BUYERS];
             let mut available = INIT_TOTAL;
             let mut total = INIT_TOTAL;
@@ -1637,6 +1662,7 @@ mod property_tests {
             let buyer = Address::generate(&env);
             token::StellarAssetClient::new(&env, &token_id).mint(&buyer, &1_000_000_000);
             client.init(&admin, &token_id, &INIT_PRICE, &INIT_TOTAL);
+            client.add_to_whitelist(&buyer);
 
             let mut total_bought = 0u32;
 
@@ -1667,10 +1693,9 @@ mod property_tests {
 }
 // ====================== CONTRACT UPGRADEABILITY (#6) ======================
 
-#[contracttype]
-#[derive(Clone)]
-pub struct ContractUpgraded {
-    pub new_wasm_hash: BytesN<32>,
+#[contractevent(data_format = "vec")]
+pub struct EventContractUpgraded {
+    new_wasm_hash: BytesN<32>,
 }
 
 #[contractimpl]
@@ -1687,12 +1712,9 @@ impl RwaMarketplace {
         admin.require_auth();
 
         // Perform the upgrade
-        env.deployer().upgrade_contract(new_wasm_hash.clone());
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
 
         // Emit upgrade event
-        env.events().publish(
-            (symbol_short!("Contract"), symbol_short!("Upgraded")),
-            ContractUpgraded { new_wasm_hash },
-        );
+        EventContractUpgraded { new_wasm_hash }.publish(&env);
     }
 }
