@@ -6,6 +6,7 @@ import Button from '../Button/Button';
 import Spinner from '../Spinner/Spinner';
 import { useWalletStore } from '../../store/useWalletStore';
 import { useAssetStore } from '../../store/useAssetStore';
+import { FAILED_TO_FETCH_PORTFOLIO_ASSET, FAILED_TO_LOAD_PORTFOLIO } from '../../constants/errors';
 import styles from './PortfolioPage.module.css';
 
 const RPC_URL = import.meta.env.VITE_RPC_URL || 'https://soroban-testnet.stellar.org:443';
@@ -81,7 +82,7 @@ export default function PortfolioPage() {
               shares: 0,
               price: 0,
               value: 0,
-              error: 'Failed to fetch',
+               error: FAILED_TO_FETCH_PORTFOLIO_ASSET,
             };
           }
         })
@@ -92,7 +93,7 @@ export default function PortfolioPage() {
       setTotalValue(valid.reduce((sum, h) => sum + h.value, 0));
     } catch (err) {
       console.error('Error fetching portfolio:', err);
-      setError('Failed to load portfolio data.');
+      setError(FAILED_TO_LOAD_PORTFOLIO);
     } finally {
       setLoading(false);
     }

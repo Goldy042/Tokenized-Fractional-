@@ -16,6 +16,17 @@ import ToastContainer from './components/Toast/Toast';
 import styles from './App.module.css';
 
 import { useWalletStore } from './store/useWalletStore';
+import {
+  TX_CONFIRMED,
+  TX_FAILED,
+  TX_SUBMITTED,
+  TX_FAILED_CHECK_BALANCE,
+  TX_FAILED_PAUSED,
+  TX_FAILED_NO_SHARES,
+  FAILED_FETCH_SHARE_BALANCE,
+  MUST_BUY_AT_LEAST_ONE_SHARE,
+  CONTRACT_NOT_CONFIGURED,
+} from './constants/errors';
 import { useAssetStore } from './store/useAssetStore';
 import { useToastStore } from './store/useToastStore';
 import useTransactionStatus from './hooks/useTransactionStatus';
@@ -93,7 +104,7 @@ function App() {
         removeToast(pendingToastRef.current);
         pendingToastRef.current = null;
       }
-      addToast({ message: 'Transaction confirmed', type: 'success', txHash: lastTxHash });
+      addToast({ message: TX_CONFIRMED, type: 'success', txHash: lastTxHash });
       setTxResult(null);
       fetchShares();
     } else if (txStatus === 'failed') {
@@ -102,7 +113,7 @@ function App() {
         removeToast(pendingToastRef.current);
         pendingToastRef.current = null;
       }
-      addToast({ message: 'Transaction failed', type: 'error', txHash: lastTxHash });
+      addToast({ message: TX_FAILED, type: 'error', txHash: lastTxHash });
       setTxError(null);
     }
   }, [lastTxHash, txStatus]);
@@ -138,7 +149,7 @@ function App() {
     },
     onError: (err) => {
       console.error('Error fetching shares:', err);
-      setError('Failed to fetch share balance.');
+      setError(FAILED_FETCH_SHARE_BALANCE);
     },
   });
 
@@ -178,7 +189,7 @@ function App() {
   const handleBuyShares = async () => {
     if (!publicKey) return;
     if (buyAmount < 1) {
-      addToast({ message: 'Must buy at least 1 share', type: 'error' });
+      addToast({ message: MUST_BUY_AT_LEAST_ONE_SHARE, type: 'error' });
       return;
     }
 
@@ -195,17 +206,17 @@ function App() {
       const hash = submitRes.hash;
       setLastTxHash(hash);
       pendingToastRef.current = addToast({
-        message: 'Transaction submitted, waiting for confirmation…',
+        message: TX_SUBMITTED,
         type: 'pending',
         txHash: hash,
       });
     } catch (err) {
       console.error('Error buying shares:', err);
-      let msg = 'Transaction failed. Check your token balance and try again.';
+      let msg = TX_FAILED_CHECK_BALANCE;
       if (err.message?.includes('paused')) {
-        msg = 'Marketplace is currently paused. Try again later.';
+        msg = TX_FAILED_PAUSED;
       } else if (err.message?.includes('Not enough shares')) {
-        msg = 'Not enough shares available.';
+        msg = TX_FAILED_NO_SHARES;
       }
       addToast({ message: msg, type: 'error' });
     }
@@ -298,7 +309,7 @@ function App() {
       {/* Contract not configured */}
       {CONTRACT_ID === 'C...' && (
         <Alert variant="warning">
-          Set VITE_CONTRACT_ID in frontend/.env to connect to a deployed contract.
+          {CONTRACT_NOT_CONFIGURED}
         </Alert>
       )}
 
