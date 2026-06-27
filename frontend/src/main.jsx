@@ -4,6 +4,7 @@ import * as Sentry from '@sentry/react';
 import './styles/theme.css';
 import App from './App';
 import ErrorFallback from './components/ErrorFallback/ErrorFallback';
+import { ThemeProvider } from './context/ThemeContext';
 
 // Initialize Sentry for error tracking and performance monitoring
 if (import.meta.env.VITE_SENTRY_DSN) {
@@ -27,10 +28,10 @@ if (import.meta.env.VITE_SENTRY_DSN) {
 
 ReactDOM.createRoot(document.getElementById('root')).render(
   <React.StrictMode>
-    <Sentry.ErrorBoundary
-      fallback={ErrorFallback}
-    >
-      <App />
+    <Sentry.ErrorBoundary fallback={ErrorFallback}>
+      <ThemeProvider>
+        <App />
+      </ThemeProvider>
     </Sentry.ErrorBoundary>
   </React.StrictMode>
 );
