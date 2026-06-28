@@ -6,6 +6,7 @@ export default defineConfig({
   plugins: [react(), sri()],
   server: {
     port: 5173,
+    host: true,
     headers: {
       'Content-Security-Policy': [
         "default-src 'self'",
