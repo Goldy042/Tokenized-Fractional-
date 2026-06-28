@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { Networks, nativeToScVal } from '@stellar/stellar-sdk';
+import { useTranslation } from 'react-i18next';
 import { useSorobanRead, useSorobanWrite } from './hooks/useSoroban';
 
 import Button from './components/Button/Button';
@@ -14,6 +15,7 @@ import AdminPage from './components/AdminPage/AdminPage';
 import PortfolioPage from './components/PortfolioPage/PortfolioPage';
 import ToastContainer from './components/Toast/Toast';
 import ConfirmPurchase from './components/ConfirmPurchase/ConfirmPurchase';
+import LanguageSwitcher from './components/LanguageSwitcher/LanguageSwitcher';
 import styles from './App.module.css';
 
 import { useWalletStore } from './store/useWalletStore';
@@ -38,6 +40,7 @@ const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
 
 function App() {
   // ── Global store state ─────────────────────────────────────────────────────
+  const { t } = useTranslation();
   const {
     publicKey,
     isConnecting,
@@ -262,6 +265,7 @@ function App() {
           </div>
         </div>
         <div className={styles.walletArea}>
+          <LanguageSwitcher />
           <button
             onClick={toggleTheme}
             className={styles.themeToggle}
@@ -277,7 +281,7 @@ function App() {
 
           {!publicKey ? (
             <Button onClick={connectWallet} variant="success" loading={isConnecting}>
-              {isConnecting ? 'Connecting…' : 'Connect Freighter'}
+              {isConnecting ? t('wallet.connecting') : t('wallet.connect')}
             </Button>
           ) : (
             <div className={styles.walletInfo}>
@@ -285,7 +289,7 @@ function App() {
                 {publicKey}
               </span>
               <Button onClick={disconnectWallet} variant="danger">
-                Disconnect
+                {t('wallet.disconnect')}
               </Button>
             </div>
           )}
@@ -298,19 +302,19 @@ function App() {
           className={`${styles.tab} ${view === 'marketplace' ? styles.tabActive : ''}`}
           onClick={() => setView('marketplace')}
         >
-          Marketplace
+          {t('nav.marketplace')}
         </button>
         <button
           className={`${styles.tab} ${view === 'portfolio' ? styles.tabActive : ''}`}
           onClick={() => setView('portfolio')}
         >
-          Portfolio
+          {t('nav.portfolio')}
         </button>
         <button
           className={`${styles.tab} ${view === 'admin' ? styles.tabActive : ''}`}
           onClick={() => setView('admin')}
         >
-          Admin
+          {t('nav.admin')}
         </button>
       </nav>
 
@@ -374,7 +378,7 @@ function App() {
 
       {/* ── Asset Listing Grid ─────────────────────────────────────────── */}
       <section className={styles.section}>
-        <h2 className={styles.sectionTitle}>Available Assets</h2>
+        <h2 className={styles.sectionTitle}>{t('marketplace.availableAssets')}</h2>
         <AssetGrid
           assets={assets}
           loading={isFetchingAssets}
@@ -387,7 +391,7 @@ function App() {
       {publicKey && (
         <Card>
           <div className={styles.holdingsRow}>
-            <span className={styles.holdingsLabel}>Your Share Balance</span>
+            <span className={styles.holdingsLabel}>{t('marketplace.shareBalance')}</span>
             {loadingShares ? (
               <span className={styles.holdingsValueLoading}>
                 <Spinner size="sm" label="Fetching share balance…" />
@@ -398,7 +402,7 @@ function App() {
             )}
           </div>
           <hr className={styles.divider} />
-          <h3 className={styles.purchaseHeader}>Buy Fractional Shares</h3>
+          <h3 className={styles.purchaseHeader}>{t('marketplace.buyShares')}</h3>
           <div className={styles.purchaseRow}>
             <Input
               id="buy-amount-input"
@@ -410,7 +414,7 @@ function App() {
               className={styles.buyInput}
             />
             <Button onClick={handleBuyShares} loading={loadingBuy} variant="primary">
-              {loadingBuy ? 'Processing…' : 'Buy Shares'}
+              {loadingBuy ? t('marketplace.processing') : t('marketplace.buyButton')}
             </Button>
           </div>
           {loadingBuy && (
