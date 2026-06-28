@@ -1,5 +1,7 @@
 # Tokenized Fractional Real-World Assets (RWA) Marketplace
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A full-stack decentralized application (dApp) built on the **Stellar Network** using **Soroban Smart Contracts**. This marketplace allows administrators to tokenize real-world assets into fractional shares for users to purchase.
 
 ## Walkthrough Demo
